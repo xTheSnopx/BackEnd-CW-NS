@@ -41,7 +41,35 @@ namespace CWNS.BackEnd.Controllers
             _context.Users.Add(user);
             await _context.SaveChangesAsync();
 
-            return StatusCode(201, new { message = "User registered successfully", user = new { user.Id, user.Username } });
+            var tokenHandler = new JwtSecurityTokenHandler();
+            var jwtSecret = _configuration["JwtSettings:Secret"] ?? string.Empty;
+            var key = Encoding.UTF8.GetBytes(jwtSecret);
+
+            var tokenDescriptor = new SecurityTokenDescriptor
+            {
+                Subject = new ClaimsIdentity(new[]
+                {
+                    new Claim("id", user.Id.ToString()),
+                    new Claim(ClaimTypes.Name, user.Username)
+                }),
+                Expires = DateTime.UtcNow.AddDays(double.Parse(_configuration["JwtSettings:ExpirationDays"] ?? "7")),
+                SigningCredentials = new SigningCredentials(new SymmetricSecurityKey(key), SecurityAlgorithms.HmacSha256Signature)
+            };
+
+            var token = tokenHandler.CreateToken(tokenDescriptor);
+
+            return StatusCode(201, new 
+            { 
+                message = "User registered successfully", 
+                token = tokenHandler.WriteToken(token), 
+                user = new 
+                { 
+                    id = user.Id, 
+                    username = user.Username, 
+                    clan_id = user.ClanId, 
+                    plan_expires_at = user.PlanExpiresAt 
+                } 
+            });
         }
 
         [HttpPost("login")]
