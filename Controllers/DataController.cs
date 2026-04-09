@@ -47,13 +47,63 @@ namespace CWNS.BackEnd.Controllers
                 if (response.IsSuccessStatusCode)
                 {
                     var content = await response.Content.ReadAsStringAsync();
-                    // We can deserialize and reserialize, or simply return the JSON directly with ContentResult
+                    var options = new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+                    var payload = System.Text.Json.JsonSerializer.Deserialize<System.Text.Json.Nodes.JsonObject>(content, options);
+                    
+                    if (payload != null && payload["clans"] is System.Text.Json.Nodes.JsonArray clansArray)
+                    {
+                        var target6h = DateTime.UtcNow.AddHours(-6);
+                        var target24h = DateTime.UtcNow.AddHours(-24);
+
+                        // Optimizado: obtener la última rep registrada ANTES del target6h para CADA miembro
+                        var past6hLogs = await _context.MemberReputationLogs
+                            .Where(l => l.Timestamp <= target6h)
+                            .GroupBy(l => new { l.ClanId, l.MemberName })
+                            .Select(g => new { 
+                                ClanId = g.Key.ClanId, 
+                                Points = g.OrderByDescending(x => x.Timestamp).Select(x => x.Points).FirstOrDefault() 
+                            })
+                            .ToListAsync();
+
+                        var past24hLogs = await _context.MemberReputationLogs
+                            .Where(l => l.Timestamp <= target24h)
+                            .GroupBy(l => new { l.ClanId, l.MemberName })
+                            .Select(g => new { 
+                                ClanId = g.Key.ClanId, 
+                                Points = g.OrderByDescending(x => x.Timestamp).Select(x => x.Points).FirstOrDefault() 
+                            })
+                            .ToListAsync();
+
+                        var clanRep6h = past6hLogs.GroupBy(x => x.ClanId).ToDictionary(g => g.Key, g => g.Sum(x => (long)x.Points));
+                        var clanRep24h = past24hLogs.GroupBy(x => x.ClanId).ToDictionary(g => g.Key, g => g.Sum(x => (long)x.Points));
+
+                        foreach (var node in clansArray)
+                        {
+                            if (node is System.Text.Json.Nodes.JsonObject clanObj)
+                            {
+                                var clanName = clanObj["name"]?.ToString();
+                                var currentRepNode = clanObj["reputation"];
+                                long currentRep = currentRepNode != null ? currentRepNode.GetValue<long>() : 0;
+                                
+                                if (!string.IsNullOrEmpty(clanName))
+                                {
+                                    long rep6h = clanRep6h.ContainsKey(clanName) ? clanRep6h[clanName] : currentRep; // If 0 tracking history, delta is 0
+                                    long rep24h = clanRep24h.ContainsKey(clanName) ? clanRep24h[clanName] : currentRep;
+                                    
+                                    clanObj["sixHourDelta"] = currentRep - rep6h;
+                                    clanObj["twentyFourHourDelta"] = currentRep - rep24h;
+                                }
+                            }
+                        }
+                        
+                        return Ok(payload);
+                    }
+                    
                     return Content(content, "application/json"); 
                 }
             } 
             catch (Exception ex)
             {
-                // Fallback in case of failure
                 Console.WriteLine("API Fetch Failed: " + ex.Message);
             }
 
@@ -66,18 +116,106 @@ namespace CWNS.BackEnd.Controllers
             if (string.IsNullOrWhiteSpace(clanId))
                 return BadRequest(new { error = "clanId is required" });
 
-            var gains = await _context.MemberReputationLogs
+            var target6h = DateTime.UtcNow.AddHours(-6);
+            
+            var allLogs = await _context.MemberReputationLogs
                 .Where(l => l.ClanId == clanId)
-                .GroupBy(l => l.MemberName)
-                .Select(g => new
-                {
-                    MemberName = g.Key,
-                    LatestPoints = g.OrderByDescending(x => x.Timestamp).Select(x => x.Points).FirstOrDefault(),
-                    TotalGain = 0 // Needs complex lag/lead logic, simplify for now
+                .OrderBy(l => l.Timestamp)
+                .ToListAsync();
+
+            var gains = allLogs.GroupBy(l => l.MemberName)
+                .Select(g => {
+                    var latest = g.Last();
+                    var pastLog = g.LastOrDefault(l => l.Timestamp <= target6h) ?? g.First();
+                    long prevPoints = pastLog.Points;
+                    
+                    // If the earliest log we have is still newer than 6 hours ago, 
+                    // we assume they gained it since we started tracking, so prevPoints is their first known point.
+                    
+                    return new {
+                        MemberName = latest.MemberName,
+                        LatestPoints = latest.Points,
+                        PrevPoints = prevPoints,
+                        Delta6h = latest.Points - prevPoints
+                    };
+                })
+                .ToList();
+
+            return Ok(gains);
+        }
+        [HttpGet("notifications")]
+        public async Task<IActionResult> GetNotifications()
+        {
+            var target2h = DateTime.UtcNow.AddHours(-2);
+            
+            // Get last 2 hours delta to detect recent bleeding
+            var pastLogs = await _context.MemberReputationLogs
+                .Where(l => l.Timestamp <= target2h)
+                .GroupBy(l => new { l.ClanId, l.MemberName })
+                .Select(g => new { 
+                    ClanId = g.Key.ClanId, 
+                    Points = g.OrderByDescending(x => x.Timestamp).Select(x => x.Points).FirstOrDefault() 
                 })
                 .ToListAsync();
 
-            return Ok(gains);
+            var currentLogs = await _context.MemberReputationLogs
+                .GroupBy(l => new { l.ClanId, l.MemberName })
+                .Select(g => new { 
+                    ClanId = g.Key.ClanId, 
+                    Points = g.OrderByDescending(x => x.Timestamp).Select(x => x.Points).FirstOrDefault() 
+                })
+                .ToListAsync();
+
+            var clanRepPast = pastLogs.GroupBy(x => x.ClanId).ToDictionary(g => g.Key, g => g.Sum(x => (long)x.Points));
+            var clanRepCurrent = currentLogs.GroupBy(x => x.ClanId).ToDictionary(g => g.Key, g => g.Sum(x => (long)x.Points));
+
+            var notifications = new List<object>();
+
+            // If we don't have past logs, it means the server just started.
+            if (!clanRepPast.Any())
+            {
+                notifications.Add(new { msg = "SYSTEM: Escaner iniciado. Mapeando red...", time = "Ahora", type = "info" });
+                return Ok(notifications);
+            }
+
+            int topActiveCount = 0;
+            long activeSum = 0;
+
+            var deltas = new Dictionary<string, long>();
+            foreach(var kv in clanRepCurrent)
+            {
+                long past = clanRepPast.ContainsKey(kv.Key) ? clanRepPast[kv.Key] : kv.Value;
+                long delta = kv.Value - past;
+                deltas[kv.Key] = delta;
+                
+                if (delta > 1000) 
+                {
+                    topActiveCount++;
+                    activeSum += delta;
+                }
+            }
+
+            // Logic: if other clans are moving, alert about zero-growth top clans.
+            if (topActiveCount >= 3)
+            {
+                foreach(var clan in deltas)
+                {
+                    // If a clan has literally 0 or very low delta while the war is active.
+                    if (clan.Value <= 0)
+                    {
+                        notifications.Add(new { 
+                            msg = $"[ADVERTENCIA] {clan.Key} está inactivo (Bleeding). ¡Cero rep en 2 horas!", 
+                            time = "Reciente", 
+                            type = "warning",
+                            clan = clan.Key
+                        });
+                    }
+                }
+            }
+
+            notifications.Add(new { msg = $"INFO: {topActiveCount} clanes activos en combate.", time = "Reciente", type = "success" });
+
+            return Ok(notifications);
         }
     }
 }
