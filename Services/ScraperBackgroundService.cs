@@ -8,31 +8,111 @@ using System.Threading.Tasks;
 
 namespace CWNS.BackEnd.Services
 {
+    public class NinjaSagaMember
+    {
+        public string name { get; set; } = string.Empty;
+        public long reputation { get; set; }
+    }
+
+    public class NinjaSagaClan
+    {
+        public int rank { get; set; }
+        public string name { get; set; } = string.Empty;
+        public int members { get; set; }
+        public long reputation { get; set; }
+        public List<NinjaSagaMember>? member_list { get; set; }
+    }
+
+    public class NinjaSagaResponse
+    {
+        public List<NinjaSagaClan>? clans { get; set; }
+    }
+
     public class ScraperBackgroundService : BackgroundService
     {
         private readonly ILogger<ScraperBackgroundService> _logger;
         private readonly IServiceProvider _serviceProvider;
+        private readonly HttpClient _httpClient;
+        private readonly Dictionary<string, long> _lastMemberPoints = new();
 
         public ScraperBackgroundService(ILogger<ScraperBackgroundService> logger, IServiceProvider serviceProvider)
         {
             _logger = logger;
             _serviceProvider = serviceProvider;
+            _httpClient = new HttpClient();
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            _logger.LogInformation("ScraperBackgroundService started.");
+            _logger.LogInformation("ScraperBackgroundService started - Fetching real data from NinjaSaga every 5 seconds");
 
             while (!stoppingToken.IsCancellationRequested)
             {
-                _logger.LogInformation("Scraper executing at: {time}", DateTimeOffset.Now);
-                
                 try
                 {
-                    using (var scope = _serviceProvider.CreateScope())
+                    var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                    var url = $"https://ninjasaga.cc/data/clan_rankings.json?t={timestamp}";
+                    
+                    var response = await _httpClient.GetAsync(url, stoppingToken);
+                    if (response.IsSuccessStatusCode)
                     {
-                        var context = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-                        // Perform scraping and DB logic here
+                        var jsonString = await response.Content.ReadAsStringAsync(stoppingToken);
+                        var options = new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+                        var data = System.Text.Json.JsonSerializer.Deserialize<NinjaSagaResponse>(jsonString, options);
+
+                        if (data?.clans != null)
+                        {
+                            using (var scope = _serviceProvider.CreateScope())
+                            {
+                                var context = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+                                var users = await context.Users.ToListAsync(stoppingToken);
+                                bool madeChanges = false;
+
+                                foreach (var clan in data.clans)
+                                {
+                                    if (clan.member_list != null)
+                                    {
+                                        foreach (var member in clan.member_list)
+                                        {
+                                            // Check anti-bloat cache
+                                            if (!_lastMemberPoints.ContainsKey(member.name) || _lastMemberPoints[member.name] != member.reputation)
+                                            {
+                                                _lastMemberPoints[member.name] = member.reputation;
+
+                                                // Update specific User (Dashboard Projection)
+                                                var matchedUser = users.FirstOrDefault(u => u.Username.Equals(member.name, StringComparison.OrdinalIgnoreCase));
+                                                if (matchedUser != null)
+                                                {
+                                                    context.ReputationLogs.Add(new Models.ReputationLog 
+                                                    { 
+                                                        UserId = matchedUser.Id, 
+                                                        Points = (int)member.reputation,
+                                                        Timestamp = DateTime.UtcNow
+                                                    });
+                                                }
+
+                                                // Update general Member Log
+                                                context.MemberReputationLogs.Add(new Models.MemberReputationLog
+                                                {
+                                                    ClanId = clan.name,
+                                                    MemberName = member.name,
+                                                    Points = (int)member.reputation,
+                                                    Timestamp = DateTime.UtcNow
+                                                });
+                                                
+                                                madeChanges = true;
+                                            }
+                                        }
+                                    }
+                                }
+                                
+                                if (madeChanges)
+                                {
+                                    await context.SaveChangesAsync(stoppingToken);
+                                    _logger.LogInformation("Saved new reputation deltas to database.");
+                                }
+                            }
+                        }
                     }
                 }
                 catch (Exception ex)
@@ -40,8 +120,8 @@ namespace CWNS.BackEnd.Services
                     _logger.LogError(ex, "Error occurred executing scraper.");
                 }
 
-                // Run every 10 minutes
-                await Task.Delay(TimeSpan.FromMinutes(10), stoppingToken);
+                // Aggressive 5 seconds refresh for instant tactical hoverboard updates
+                await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
             }
         }
     }

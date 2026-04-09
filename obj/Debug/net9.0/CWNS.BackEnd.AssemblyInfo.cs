@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("CWNS.BackEnd")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+e69d79ca634bc0434c6d3b149323dfda46d029e7")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+f744466f237b53601dc77858d66615c3dc757e2c")]
 [assembly: System.Reflection.AssemblyProductAttribute("CWNS.BackEnd")]
 [assembly: System.Reflection.AssemblyTitleAttribute("CWNS.BackEnd")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
