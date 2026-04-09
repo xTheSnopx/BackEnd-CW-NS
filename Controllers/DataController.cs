@@ -254,5 +254,36 @@ namespace CWNS.BackEnd.Controllers
 
             return Ok(notifications);
         }
+        [HttpGet("my-profile")]
+        [Authorize]
+        public async Task<IActionResult> GetMyProfile()
+        {
+            var username = User.Claims.FirstOrDefault(c => c.Type == ClaimTypes.Name)?.Value;
+            if (string.IsNullOrEmpty(username)) return Unauthorized();
+
+            var myLog = await _context.MemberReputationLogs
+                .Where(l => l.MemberName == username)
+                .OrderByDescending(l => l.Timestamp)
+                .FirstOrDefaultAsync();
+
+            if (myLog == null) 
+                return NotFound(new { error = "No records found for your NinjaSaga character." });
+
+            var clanId = myLog.ClanId;
+
+            // Get personal tracking
+            var recentPersonalLogs = await _context.MemberReputationLogs
+                .Where(l => l.MemberName == username)
+                .OrderByDescending(l => l.Timestamp)
+                .Take(50)
+                .ToListAsync();
+
+            return Ok(new {
+                Username = username,
+                ClanName = clanId,
+                CurrentReputation = myLog.Points,
+                History = recentPersonalLogs
+            });
+        }
     }
 }
